@@ -15,3 +15,5 @@ pretrained_models/
 # Eval
 data
 data/
+# Fast patch backups
+*.before_fast_patch

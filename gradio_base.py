@@ -153,6 +153,7 @@ class FireRedDemoWrapper:
             do_split=True,
             seed=seed,
             inference_cfg=cfg,
+            n_timesteps=int(os.environ.get("FIRERED_N_TIMESTEPS", "10")),
         )
         wav_np = gen_audio.squeeze(0).detach().cpu().numpy()
         return int(gen_audio_sr), wav_np
@@ -324,6 +325,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Initialize App
+    print(
+        f"[FAST] FireRed flow steps: {int(os.environ.get('FIRERED_N_TIMESTEPS', '10'))}",
+        flush=True,
+    )
     tts = FireRedTTS3(
         'pretrained_models',
         use_wetext=False,

@@ -1,4 +1,5 @@
 import os
+import hashlib
 import torch
 import torchaudio
 import torch.nn.functional as F
@@ -46,7 +47,7 @@ Qwen3_1_7B_ConfigDict = {
     "use_cache": True,
     "use_sliding_window": False,
     "vocab_size": 151936,
-    "attn_implementation": "flash_attention_2",
+    "attn_implementation": "sdpa",
 }
 
 
@@ -284,6 +285,15 @@ class FireRedTTS3Base(object):
         assert os.path.exists(spk_ckpt_path), f'{spk_ckpt_path} not found'
         self.spk_extractor = CamppEmbedding(spk_ckpt_path)
         self.spk_extractor.to(self.device)
+
+        # Fixed-reference dubbing optimization.
+        # Cache expensive prompt conditioning (RedAE encode + CAM++ speaker
+        # embedding) when the same reference waveform is used repeatedly.
+        self._prompt_cache_key = None
+        self._prompt_cache_latents = None
+        self._prompt_cache_spk_emb = None
+        self._prompt_cache_num_samples = None
+        self._prompt_cache_hit_announced = False
     
     def _tokenize_text(self, text:str):
         tokens = self.text_tokenizer(
@@ -315,15 +325,51 @@ class FireRedTTS3Base(object):
         text_tokens = self._tokenize_text(input_text)
         # Prompt audio
         prompt_audio = prompt_audio[:1]
-        prompt_audio = torchaudio.functional.resample(prompt_audio, prompt_audio_sr, self.redae.sample_rate)
-        prompt_audio_sr = self.redae.sample_rate
-        prompt_audio = self.redae.pad_to_multiple_of(prompt_audio, self.redae.downsample_rate*self.tts_core.patch_size)
-        prompt_audio = prompt_audio.to(self.device)
-        prompt_latents = self.redae.encode(prompt_audio, prompt_audio_sr)
-        prompt_latents = prompt_latents.to(torch.float32)
-        # Spk emb
-        spk_emb = self.spk_extractor.forward(prompt_audio, prompt_audio_sr)
-        spk_emb = spk_emb.to(self.device)
+
+        # Hash the small reference waveform on CPU. This is cheap compared with
+        # repeatedly running RedAE + CAM++ over a 5-20 s reference clip.
+        _prompt_cpu = prompt_audio.detach().to("cpu").contiguous()
+        _prompt_hash = hashlib.sha1(_prompt_cpu.numpy().tobytes()).digest()
+        _prompt_key = (
+            int(prompt_audio_sr),
+            tuple(_prompt_cpu.shape),
+            str(_prompt_cpu.dtype),
+            _prompt_hash,
+        )
+
+        if _prompt_key == self._prompt_cache_key:
+            prompt_latents = self._prompt_cache_latents
+            spk_emb = self._prompt_cache_spk_emb
+            prompt_num_samples = self._prompt_cache_num_samples
+            if not self._prompt_cache_hit_announced:
+                print("[FAST] Reusing cached prompt latents + speaker embedding", flush=True)
+                self._prompt_cache_hit_announced = True
+        else:
+            prompt_audio = torchaudio.functional.resample(
+                prompt_audio, prompt_audio_sr, self.redae.sample_rate
+            )
+            prompt_audio_sr = self.redae.sample_rate
+            prompt_audio = self.redae.pad_to_multiple_of(
+                prompt_audio,
+                self.redae.downsample_rate * self.tts_core.patch_size,
+            )
+            prompt_audio = prompt_audio.to(self.device)
+
+            prompt_latents = self.redae.encode(prompt_audio, prompt_audio_sr)
+            prompt_latents = prompt_latents.to(torch.float32)
+
+            # Speaker embedding
+            spk_emb = self.spk_extractor.forward(prompt_audio, prompt_audio_sr)
+            spk_emb = spk_emb.to(self.device)
+
+            prompt_num_samples = prompt_audio.shape[1]
+
+            self._prompt_cache_key = _prompt_key
+            self._prompt_cache_latents = prompt_latents
+            self._prompt_cache_spk_emb = spk_emb
+            self._prompt_cache_num_samples = prompt_num_samples
+            self._prompt_cache_hit_announced = False
+            print("[FAST] Cached prompt latents + speaker embedding", flush=True)
         # TTS
         if seed is not None:
             fix_seed(seed)
@@ -342,5 +388,5 @@ class FireRedTTS3Base(object):
         )
         gen_audio, gen_audio_sr = self.redae.decode(gen_latents)
         # Remove prompts
-        gen_audio = gen_audio[:, prompt_audio.shape[1]:]
+        gen_audio = gen_audio[:, prompt_num_samples:]
         return gen_audio, gen_audio_sr
